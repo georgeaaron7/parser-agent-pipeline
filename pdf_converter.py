@@ -9,18 +9,13 @@ class PDFToImageConverter:
         os.makedirs(output_dir, exist_ok=True)
     
     def convert_pdf_to_images(self, pdf_path, dpi=300):
-        """
-        Convert PDF to images and return list of image paths
-        """
         try:
-            # Convert PDF to images
             images = pdf2image.convert_from_path(pdf_path, dpi=dpi)
             image_paths = []
             
             pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
             
             for i, image in enumerate(images):
-                # Save each page as an image
                 image_path = os.path.join(self.output_dir, f"{pdf_name}_page_{i+1}.png")
                 image.save(image_path, "PNG")
                 image_paths.append(image_path)
