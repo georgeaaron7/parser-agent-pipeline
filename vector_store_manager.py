@@ -3,19 +3,18 @@ from qdrant_client.models import Distance, VectorParams, PointStruct
 import sqlite3
 import json
 import uuid
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import numpy as np
 import gc
 import torch
+from database_manager import DatabaseManager
 
-# Multiple fallback embedding approaches
 try:
     from sentence_transformers import SentenceTransformer
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
 
-# Lightweight alternatives
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.decomposition import TruncatedSVD
@@ -35,72 +34,127 @@ class VectorStoreManager:
         self.use_gpu = use_gpu and torch.cuda.is_available()
         self.batch_size = batch_size
         self.device = 'cuda' if self.use_gpu else 'cpu'
+        self.db_manager = DatabaseManager(db_path)
         
-        # Initialize embedding model with GPU optimization
-        self._init_embedding_model(embedding_model)
-        
+        # Initialize embedding model and get existing collection info BEFORE init
+        existing_dim = self._get_existing_collection_dimension()
+        self._init_embedding_model(embedding_model, existing_dim)
         self.init_vector_collection()
-        self.init_database()
     
-    def _init_embedding_model(self, model_type="lightweight"):
-        """Initialize the most appropriate embedding model for available resources"""
-        
-        if model_type == "lightweight" or not SENTENCE_TRANSFORMERS_AVAILABLE:
-            self._init_tfidf_embedding()
-            return
+    def _get_existing_collection_dimension(self) -> Optional[int]:
+        """Get dimension of existing collection to maintain consistency"""
+        try:
+            collections = self.client.get_collections()
+            collection_exists = any(c.name == self.collection_name for c in collections.collections)
             
-        if model_type == "cpu_optimized":
+            if collection_exists:
+                existing = self.client.get_collection(self.collection_name)
+                existing_dim = existing.config.params.vectors.size
+                existing_count = existing.points_count
+                print(f"Found existing collection: {existing_count} vectors, dim={existing_dim}")
+                return existing_dim
+        except Exception as e:
+            print(f"Error checking existing collection: {e}")
+        
+        return None
+    
+    def _init_embedding_model(self, model_type="lightweight", existing_dim=None):
+        """Initialize embedding model, adapting to existing collection if needed"""
+        
+        # If we have existing vectors, prefer SentenceTransformers for consistency
+        if existing_dim == 384:
+            print(f"Adapting to existing collection dimension: {existing_dim}")
+            if SENTENCE_TRANSFORMERS_AVAILABLE:
+                self._init_cpu_sentence_transformer()
+                return
+            else:
+                print("SentenceTransformers not available, cannot use existing 384-dim collection")
+        
+        # Otherwise initialize based on requested type
+        if model_type == "lightweight" and not existing_dim:
+            if SKLEARN_AVAILABLE:
+                self._init_tfidf_embedding()
+            else:
+                print("scikit-learn not available, falling back to SentenceTransformers")
+                self._init_cpu_sentence_transformer()
+        elif model_type == "cpu_optimized" or existing_dim == 384:
             self._init_cpu_sentence_transformer()
         elif model_type == "gpu_optimized" and self.use_gpu:
             self._init_gpu_sentence_transformer()
         else:
-            self._init_tfidf_embedding()
+            # Default fallback
+            if SENTENCE_TRANSFORMERS_AVAILABLE:
+                self._init_cpu_sentence_transformer()
+            else:
+                self._init_tfidf_embedding()
     
     def _init_tfidf_embedding(self):
-        """Ultra-lightweight TF-IDF embedding (no GPU needed)"""
+        """Initialize TF-IDF with adaptive dimensions"""
         self.embedding_method = "tfidf"
-        self.embedding_dim = 256  # Smaller dimension for efficiency
+        self.model_path = "lightweight_tfidf_model.pkl"
+        
+        # Try to load existing model first
+        if self._try_load_existing_tfidf_model():
+            return
+        
+        # Initialize with reasonable defaults - will be adapted when fitting
+        self.embedding_dim = 128  # Start with smaller dimension
         self.vectorizer = TfidfVectorizer(
-            max_features=300,  # Reduced features
+            max_features=200,  # Reduced for small datasets
             stop_words='english',
             ngram_range=(1, 2),
             min_df=1,
             max_df=0.95
         )
-        self.svd = TruncatedSVD(n_components=self.embedding_dim, random_state=42)
+        self.svd = None  # Will be initialized with correct dimensions
         self.is_fitted = False
-        self.model_path = "lightweight_tfidf_model.pkl"
-        print(f"Using lightweight TF-IDF embeddings (dim: {self.embedding_dim}, CPU-only)")
+        
+        print(f"Initialized TF-IDF embeddings (adaptive dimensions)")
+    
+    def _try_load_existing_tfidf_model(self) -> bool:
+        """Try to load existing TF-IDF model"""
+        if os.path.exists(self.model_path):
+            try:
+                with open(self.model_path, 'rb') as f:
+                    model_data = pickle.load(f)
+                    self.vectorizer = model_data['vectorizer']
+                    self.svd = model_data['svd']
+                    self.embedding_dim = model_data.get('n_components', self.svd.n_components)
+                    self.is_fitted = True
+                    print(f"Loaded existing TF-IDF model (dim: {self.embedding_dim})")
+                    return True
+            except Exception as e:
+                print(f"Failed to load TF-IDF model: {e}")
+        return False
     
     def _init_cpu_sentence_transformer(self):
         """CPU-optimized sentence transformer"""
         try:
             self.model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
-            self.model.max_seq_length = 256  # Limit sequence length
+            self.model.max_seq_length = 256
             self.embedding_dim = 384
             self.embedding_method = "sentence_transformers_cpu"
-            print("Using CPU-optimized SentenceTransformers")
+            print("Using CPU-optimized SentenceTransformers (384 dim)")
         except Exception as e:
             print(f"Failed to load CPU SentenceTransformers: {e}")
-            self._init_tfidf_embedding()
+            if SKLEARN_AVAILABLE:
+                self._init_tfidf_embedding()
+            else:
+                raise Exception("No embedding models available")
     
     def _init_gpu_sentence_transformer(self):
-        """GPU-optimized sentence transformer with memory management"""
+        """GPU-optimized sentence transformer"""
         try:
-            # Use smaller model for GPU efficiency
             self.model = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
-            self.model.max_seq_length = 128  # Shorter sequences for GPU memory
+            self.model.max_seq_length = 128
             self.embedding_dim = 384
             self.embedding_method = "sentence_transformers_gpu"
-            
-            # Enable mixed precision if available
             if hasattr(torch, 'cuda') and torch.cuda.is_available():
                 try:
-                    self.model.half()  # Use FP16 to save GPU memory
-                    print("Using GPU-optimized SentenceTransformers with FP16")
+                    self.model.half()
+                    print("Using GPU-optimized SentenceTransformers with FP16 (384 dim)")
                 except:
-                    print("Using GPU-optimized SentenceTransformers with FP32")
-            
+                    print("Using GPU-optimized SentenceTransformers with FP32 (384 dim)")
         except Exception as e:
             print(f"Failed to load GPU SentenceTransformers: {e}")
             self._init_cpu_sentence_transformer()
@@ -111,35 +165,119 @@ class VectorStoreManager:
             torch.cuda.empty_cache()
             gc.collect()
     
+    def _fit_tfidf_model_from_texts(self, texts: List[str]) -> bool:
+        """Fit TF-IDF model with adaptive dimensions based on actual data"""
+        if not texts:
+            print("No texts provided for TF-IDF fitting")
+            return False
+        
+        try:
+            print(f"Fitting TF-IDF model with {len(texts)} text samples...")
+            
+            # Fit vectorizer
+            tfidf_matrix = self.vectorizer.fit_transform(texts)
+            n_features = tfidf_matrix.shape[1]
+            
+            print(f"TF-IDF matrix shape: {tfidf_matrix.shape}")
+            print(f"Available features: {n_features}")
+            
+            # Adaptive SVD components - must be less than n_features
+            n_components = min(128, n_features - 1, len(texts) - 1)
+            n_components = max(n_components, 10)  # Minimum 10 components
+            
+            print(f"Using {n_components} SVD components")
+            
+            # Initialize and fit SVD
+            self.svd = TruncatedSVD(n_components=n_components, random_state=42)
+            self.svd.fit(tfidf_matrix)
+            
+            # Update embedding dimension
+            self.embedding_dim = n_components
+            self.is_fitted = True
+            
+            # Save model
+            try:
+                with open(self.model_path, 'wb') as f:
+                    pickle.dump({
+                        'vectorizer': self.vectorizer,
+                        'svd': self.svd,
+                        'n_components': n_components
+                    }, f)
+                print(f"Saved TF-IDF model (dim: {self.embedding_dim})")
+            except Exception as e:
+                print(f"Warning: Could not save TF-IDF model: {e}")
+            
+            # Test the model
+            test_embedding = self._encode_tfidf(texts[0])
+            non_zero_count = sum(1 for x in test_embedding if abs(x) > 1e-10)
+            print(f"Model test: {non_zero_count}/{len(test_embedding)} non-zero values")
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error fitting TF-IDF model: {e}")
+            self.is_fitted = False
+            return False
+    
+    def _get_texts_from_database(self) -> List[str]:
+        """Get text samples from database for model fitting"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+            SELECT text_content FROM text_content 
+            WHERE text_content IS NOT NULL AND LENGTH(text_content) > 10
+            ORDER BY id
+            ''')
+            
+            texts = [row[0] for row in cursor.fetchall()]
+            conn.close()
+            return texts
+        except Exception as e:
+            print(f"Error getting texts from database: {e}")
+            return []
+    
     def encode(self, text: str) -> List[float]:
-        """Memory-efficient text encoding"""
+        """Text encoding with improved error handling"""
         if self.embedding_method == "tfidf":
             return self._encode_tfidf(text)
         elif "sentence_transformers" in self.embedding_method:
             return self._encode_sentence_transformer(text)
         else:
+            print("Warning: No valid embedding method")
             return [0.0] * self.embedding_dim
     
     def _encode_tfidf(self, text: str) -> List[float]:
-        """TF-IDF encoding (CPU-only, very lightweight)"""
+        """TF-IDF encoding with automatic fitting"""
         if not self.is_fitted:
-            return [0.0] * self.embedding_dim
+            print("TF-IDF model not fitted, attempting to fit from database...")
+            texts = self._get_texts_from_database()
+            if texts:
+                success = self._fit_tfidf_model_from_texts(texts)
+                if not success:
+                    print("Failed to fit TF-IDF model")
+                    return [0.0] * self.embedding_dim
+            else:
+                print("No text data available for fitting")
+                return [0.0] * self.embedding_dim
         
         try:
+            if not text or not text.strip():
+                return [0.0] * self.embedding_dim
+            
             tfidf_vec = self.vectorizer.transform([text])
             embedding = self.svd.transform(tfidf_vec)
             return embedding[0].tolist()
-        except:
+        except Exception as e:
+            print(f"Error in TF-IDF encoding: {e}")
             return [0.0] * self.embedding_dim
     
     def _encode_sentence_transformer(self, text: str) -> List[float]:
-        """Sentence transformer encoding with memory optimization"""
+        """Sentence transformer encoding"""
         try:
-            # Truncate text to prevent memory issues
             if len(text) > 500:
                 text = text[:500]
-            
-            # Encode with no gradient computation to save memory
             with torch.no_grad():
                 if self.use_gpu:
                     embedding = self.model.encode(text, show_progress_bar=False, 
@@ -157,18 +295,14 @@ class VectorStoreManager:
             self._clear_gpu_cache()
     
     def encode_batch(self, texts: List[str]) -> List[List[float]]:
-        """Batch encoding with memory management"""
+        """Batch encoding"""
         if self.embedding_method == "tfidf":
             return [self._encode_tfidf(text) for text in texts]
         
         embeddings = []
-        # Process in smaller batches to prevent GPU memory overflow
         for i in range(0, len(texts), self.batch_size):
             batch_texts = texts[i:i + self.batch_size]
-            
-            # Truncate texts
             batch_texts = [text[:500] for text in batch_texts]
-            
             try:
                 with torch.no_grad():
                     if self.use_gpu:
@@ -186,91 +320,89 @@ class VectorStoreManager:
                 
             except Exception as e:
                 print(f"Error in batch encoding: {e}")
-                # Fallback to individual encoding
                 for text in batch_texts:
                     embeddings.append(self.encode(text))
-            
             finally:
                 self._clear_gpu_cache()
-        
         return embeddings
     
-    def init_database(self):
-        """Initialize text storage table"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS tables (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_number INTEGER,
-            source_file TEXT,
-            table_data TEXT,
-            description TEXT,
-            columns TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS formulas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_number INTEGER,
-            source_file TEXT,
-            original_formula TEXT,
-            parsed_formula TEXT,
-            formula_type TEXT,
-            variables TEXT,
-            description TEXT,
-            executable_code TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-
-        
-        conn.commit()
-        conn.close()
-    
     def init_vector_collection(self):
-        """Initialize or fix Qdrant collection with correct dimension"""
+        """Initialize Qdrant collection - SAFE version that preserves existing data"""
         try:
             collections = self.client.get_collections()
             collection_exists = any(c.name == self.collection_name for c in collections.collections)
 
             if not collection_exists:
-                # Fresh create
+                # Create new collection
                 self.client.create_collection(
                     collection_name=self.collection_name,
                     vectors_config=VectorParams(size=self.embedding_dim, distance=Distance.COSINE)
                 )
                 print(f"Created Qdrant collection: {self.collection_name} (dim={self.embedding_dim})")
-
             else:
-                # Check existing collection details
                 existing = self.client.get_collection(self.collection_name)
                 existing_dim = existing.config.params.vectors.size
-
+                existing_count = existing.points_count
+                
                 if existing_dim != self.embedding_dim:
-                    print(
-                        f"[VectorStoreManager] Dimension mismatch: "
-                        f"Qdrant={existing_dim}, expected={self.embedding_dim}. "
-                        f"Recreating collection..."
-                    )
-                    self.client.delete_collection(self.collection_name)
-                    self.client.create_collection(
-                        collection_name=self.collection_name,
-                        vectors_config=VectorParams(size=self.embedding_dim, distance=Distance.COSINE)
-                    )
-                    print(f"Recreated Qdrant collection with dim={self.embedding_dim}")
+                    print(f"Dimension mismatch: Qdrant={existing_dim}, model={self.embedding_dim}")
+                    
+                    if existing_count == 0:
+                        # Safe to recreate empty collection
+                        print("Collection is empty, recreating with new dimensions...")
+                        self.client.delete_collection(self.collection_name)
+                        self.client.create_collection(
+                            collection_name=self.collection_name,
+                            vectors_config=VectorParams(size=self.embedding_dim, distance=Distance.COSINE)
+                        )
+                        print(f"Recreated collection with dim={self.embedding_dim}")
+                    else:
+                        # Adapt model to existing collection to preserve data
+                        print(f"Collection has {existing_count} vectors, adapting model to existing dim={existing_dim}")
+                        self._adapt_model_to_dimension(existing_dim)
                 else:
-                    print(f"Qdrant collection {self.collection_name} exists with correct dim={existing_dim}")
+                    print(f"Collection exists with correct dim={existing_dim}, {existing_count} vectors")
 
         except Exception as e:
             print(f"Error initializing Qdrant collection: {str(e)}")
-
+    
+    def _adapt_model_to_dimension(self, target_dim: int):
+        """Adapt embedding model to match existing collection dimension"""
+        if target_dim == 384 and SENTENCE_TRANSFORMERS_AVAILABLE:
+            print("Switching to SentenceTransformers to match existing 384-dim collection")
+            self._init_cpu_sentence_transformer()
+        elif self.embedding_method == "tfidf":
+            print(f"Adapting TF-IDF model to dimension {target_dim}")
+            self.embedding_dim = target_dim
+            # Reinitialize SVD with target dimension if model is fitted
+            if hasattr(self, 'is_fitted') and self.is_fitted:
+                texts = self._get_texts_from_database()
+                if texts:
+                    self._fit_tfidf_model_with_target_dim(texts, target_dim)
+        else:
+            print(f"Cannot adapt {self.embedding_method} to dimension {target_dim}")
+    
+    def _fit_tfidf_model_with_target_dim(self, texts: List[str], target_dim: int):
+        """Fit TF-IDF model with specific target dimension"""
+        try:
+            tfidf_matrix = self.vectorizer.fit_transform(texts)
+            n_features = tfidf_matrix.shape[1]
+            
+            # Use target dimension but ensure it's valid
+            n_components = min(target_dim, n_features - 1, len(texts) - 1)
+            n_components = max(n_components, 10)
+            
+            self.svd = TruncatedSVD(n_components=n_components, random_state=42)
+            self.svd.fit(tfidf_matrix)
+            self.embedding_dim = n_components
+            self.is_fitted = True
+            
+            print(f"Fitted TF-IDF model with target dimension {n_components}")
+        except Exception as e:
+            print(f"Error fitting TF-IDF with target dimension: {e}")
     
     def chunk_text(self, text: str, chunk_size: int = 400, overlap: int = 40) -> List[str]:
-        """Smaller chunks for better GPU memory management"""
+        """Text chunking"""
         if len(text) <= chunk_size:
             return [text]
         
@@ -297,44 +429,33 @@ class VectorStoreManager:
             
         return chunks
     
-    def _load_or_create_tfidf_model(self, texts: List[str]):
-        """Efficient TF-IDF model loading/creation"""
-        if os.path.exists(self.model_path) and not self.is_fitted:
-            try:
-                with open(self.model_path, 'rb') as f:
-                    model_data = pickle.load(f)
-                    self.vectorizer = model_data['vectorizer']
-                    self.svd = model_data['svd']
-                    self.is_fitted = True
-                    print("Loaded existing lightweight TF-IDF model")
-                    return
-            except Exception as e:
-                print(f"Failed to load TF-IDF model: {e}")
-        
-        if not self.is_fitted and texts:
-            print("Fitting TF-IDF model...")
-            tfidf_matrix = self.vectorizer.fit_transform(texts)
-            self.svd.fit(tfidf_matrix)
-            self.is_fitted = True
+    def clear_document_vectors(self, document_id: int):
+        """Clear all vectors for a specific document"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute('SELECT vector_id FROM text_content WHERE document_id = ?', (document_id,))
+            vector_ids = [row[0] for row in cursor.fetchall()]
+            conn.close()
             
-            try:
-                with open(self.model_path, 'wb') as f:
-                    pickle.dump({
-                        'vectorizer': self.vectorizer,
-                        'svd': self.svd
-                    }, f)
-                print("Saved lightweight TF-IDF model")
-            except Exception as e:
-                print(f"Failed to save TF-IDF model: {e}")
+            if vector_ids:
+                self.client.delete(
+                    collection_name=self.collection_name,
+                    points_selector=vector_ids
+                )
+                print(f"Deleted {len(vector_ids)} vectors for document {document_id}")
+        except Exception as e:
+            print(f"Error clearing document vectors: {e}")
     
-    def store_text_content(self, text_pages: List[Dict]):
-        """Memory-efficient content storage with batch processing"""
+    def store_text_content(self, document_id: int, text_pages: List[Dict]):
+        """Store text content with robust error handling"""
         points = []
         text_records = []
         all_texts = []
         
-        print("Preparing text content...")
-        # Collect all texts
+        print(f"Preparing text content for document {document_id}...")
+        
+        # Collect all texts for model fitting if needed
         for page_info in text_pages:
             text_content = page_info['text']
             if text_content.strip():
@@ -343,11 +464,15 @@ class VectorStoreManager:
         
         print(f"Processing {len(all_texts)} text chunks...")
         
-        # Fit TF-IDF model if needed
-        if self.embedding_method == "tfidf":
-            self._load_or_create_tfidf_model(all_texts)
+        # Ensure model is ready
+        if self.embedding_method == "tfidf" and not self.is_fitted:
+            print("Fitting TF-IDF model...")
+            success = self._fit_tfidf_model_from_texts(all_texts)
+            if not success:
+                print("Failed to fit TF-IDF model, cannot store text content")
+                return
         
-        # Process in batches to manage memory
+        # Process pages
         batch_texts = []
         batch_metadata = []
         
@@ -364,13 +489,13 @@ class VectorStoreManager:
             for i, chunk in enumerate(chunks):
                 batch_texts.append(chunk)
                 batch_metadata.append({
+                    'document_id': document_id,
                     'page_number': page_number,
                     'source_file': image_path.split('/')[-1],
                     'chunk_index': i,
                     'text_content': chunk
                 })
                 
-                # Process batch when it reaches batch_size
                 if len(batch_texts) >= self.batch_size:
                     self._process_batch(batch_texts, batch_metadata, points, text_records)
                     batch_texts = []
@@ -382,27 +507,28 @@ class VectorStoreManager:
         
         # Store in databases
         self._store_in_databases(points, text_records)
-        
-        # Final cleanup
         self._clear_gpu_cache()
     
     def _process_batch(self, texts, metadata, points, text_records):
-        """Process a batch of texts efficiently"""
+        """Process a batch of texts"""
         try:
-            # Get embeddings for batch
             if self.embedding_method == "tfidf":
                 embeddings = [self.encode(text) for text in texts]
             else:
                 embeddings = self.encode_batch(texts)
             
-            # Create points and records
             for text, meta, embedding in zip(texts, metadata, embeddings):
-                vector_id = str(uuid.uuid4())
+                # Skip zero vectors
+                if all(abs(x) < 1e-10 for x in embedding):
+                    print(f"Skipping zero vector for text: {text[:50]}...")
+                    continue
                 
+                vector_id = str(uuid.uuid4())
                 point = PointStruct(
                     id=vector_id,
                     vector=embedding,
                     payload={
+                        'document_id': meta['document_id'],
                         'page_number': meta['page_number'],
                         'source_file': meta['source_file'],
                         'text_content': text,
@@ -413,10 +539,9 @@ class VectorStoreManager:
                 points.append(point)
                 
                 text_records.append((
-                    vector_id, meta['page_number'], meta['source_file'],
-                    text, 'body_text', meta['chunk_index']
+                    vector_id, meta['document_id'], meta['page_number'], 
+                    meta['source_file'], text, 'body_text', meta['chunk_index']
                 ))
-                
         except Exception as e:
             print(f"Error processing batch: {e}")
     
@@ -438,8 +563,8 @@ class VectorStoreManager:
                 cursor = conn.cursor()
                 
                 cursor.executemany('''
-                INSERT INTO text_content (vector_id, page_number, source_file, text_content, text_type, chunk_index)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO text_content (vector_id, document_id, page_number, source_file, text_content, text_type, chunk_index)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ''', text_records)
                 
                 conn.commit()
@@ -448,19 +573,32 @@ class VectorStoreManager:
             except Exception as e:
                 print(f"Error storing in SQLite: {str(e)}")
     
-    def search_similar_text(self, query: str, limit: int = 5) -> List[Dict]:
-        """Memory-efficient similarity search"""
+    def search_similar_text(self, query: str, limit: int = 5, document_id: Optional[int] = None) -> List[Dict]:
+        """Similarity search with improved error handling"""
         try:
             query_embedding = self.encode(query)
             
-            if all(x == 0.0 for x in query_embedding):
-                print("Warning: Query embedding is zero vector")
-                return self._fallback_text_search(query, limit)
+            if all(abs(x) < 1e-10 for x in query_embedding):
+                print("Query embedding is zero vector, using fallback search")
+                return self._fallback_text_search(query, limit, document_id)
+            
+            search_filter = None
+            if document_id is not None:
+                from qdrant_client.models import Filter, FieldCondition, MatchValue
+                search_filter = Filter(
+                    must=[
+                        FieldCondition(
+                            key="document_id",
+                            match=MatchValue(value=document_id)
+                        )
+                    ]
+                )
             
             search_results = self.client.search(
                 collection_name=self.collection_name,
                 query_vector=query_embedding,
                 limit=limit,
+                query_filter=search_filter,
                 with_payload=True
             )
             
@@ -469,6 +607,7 @@ class VectorStoreManager:
                 results.append({
                     'id': result.id,
                     'score': result.score,
+                    'document_id': result.payload['document_id'],
                     'page_number': result.payload['page_number'],
                     'source_file': result.payload['source_file'],
                     'text_content': result.payload['text_content'],
@@ -480,34 +619,44 @@ class VectorStoreManager:
             
         except Exception as e:
             print(f"Error searching vectors: {str(e)}")
-            return self._fallback_text_search(query, limit)
+            return self._fallback_text_search(query, limit, document_id)
         finally:
             self._clear_gpu_cache()
     
-    def _fallback_text_search(self, query: str, limit: int) -> List[Dict]:
+    def _fallback_text_search(self, query: str, limit: int, document_id: Optional[int] = None) -> List[Dict]:
         """Fallback text search using SQLite"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
             
-            cursor.execute('''
-            SELECT vector_id, page_number, source_file, text_content, text_type, chunk_index
-            FROM text_content
-            WHERE text_content LIKE ?
-            ORDER BY page_number
-            LIMIT ?
-            ''', (f'%{query}%', limit))
+            if document_id is not None:
+                cursor.execute('''
+                SELECT vector_id, document_id, page_number, source_file, text_content, text_type, chunk_index
+                FROM text_content
+                WHERE text_content LIKE ? AND document_id = ?
+                ORDER BY page_number
+                LIMIT ?
+                ''', (f'%{query}%', document_id, limit))
+            else:
+                cursor.execute('''
+                SELECT vector_id, document_id, page_number, source_file, text_content, text_type, chunk_index
+                FROM text_content
+                WHERE text_content LIKE ?
+                ORDER BY page_number
+                LIMIT ?
+                ''', (f'%{query}%', limit))
             
             results = []
             for row in cursor.fetchall():
                 results.append({
                     'id': row[0],
                     'score': 0.5,
-                    'page_number': row[1],
-                    'source_file': row[2],
-                    'text_content': row[3],
-                    'text_type': row[4],
-                    'chunk_index': row[5]
+                    'document_id': row[1],
+                    'page_number': row[2],
+                    'source_file': row[3],
+                    'text_content': row[4],
+                    'text_type': row[5],
+                    'chunk_index': row[6]
                 })
             
             conn.close()
@@ -523,45 +672,3 @@ class VectorStoreManager:
         if hasattr(self, 'model'):
             del self.model
         gc.collect()
-
-# Usage example with different optimization levels
-if __name__ == "__main__":
-    import sys
-    
-    # Different modes for different hardware
-    if "--gpu" in sys.argv:
-        # GPU mode with memory optimization
-        vector_manager = VectorStoreManager(
-            use_gpu=True, 
-            batch_size=8,  # Smaller batch for GPU memory
-            embedding_model="gpu_optimized"
-        )
-    elif "--cpu" in sys.argv:
-        # CPU-optimized mode
-        vector_manager = VectorStoreManager(
-            use_gpu=False,
-            batch_size=32,  # Larger batch for CPU
-            embedding_model="cpu_optimized"
-        )
-    else:
-        # Lightweight mode (default)
-        vector_manager = VectorStoreManager(
-            use_gpu=False,
-            batch_size=64,  # Even larger batch for lightweight mode
-            embedding_model="lightweight"
-        )
-    
-    if len(sys.argv) >= 2 and sys.argv[-1].endswith('.json'):
-        with open(sys.argv[-1], 'r') as f:
-            analysis_results = json.load(f)
-        
-        vector_manager.store_text_content(analysis_results['text_pages'])
-        print("Vector storage complete!")
-        
-        # Cleanup
-        vector_manager.cleanup()
-    else:
-        print("Usage: python gpu_optimized_vector_store_manager.py [--gpu|--cpu] <content_analysis.json>")
-        print("  --gpu: Use GPU-optimized mode (requires CUDA)")
-        print("  --cpu: Use CPU-optimized mode")
-        print("  (default): Use lightweight TF-IDF mode")
