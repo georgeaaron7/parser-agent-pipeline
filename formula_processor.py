@@ -1,50 +1,28 @@
-
 import sqlite3
 import json
 import re
+import os
 import sympy as sp
 from sympy.parsing.latex import parse_latex
 from sympy.parsing.sympy_parser import parse_expr
 import numpy as np
 from typing import List, Dict, Any
+from database_manager import DatabaseManager
 
 class FormulaProcessor:
     def __init__(self, db_path="rag_database.db"):
         self.db_path = db_path
-        self.init_database()
-    
-    def init_database(self):
-        """Initialize formulas table in SQLite database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-        CREATE TABLE formulas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            page_number INTEGER,
-            source_file TEXT,
-            original_formula TEXT,
-            parsed_formula TEXT,
-            formula_type TEXT,
-            variables TEXT,
-            description TEXT,
-            executable_code TEXT
-        )
-        ''')
-        
-        conn.commit()
-        conn.close()
+        self.db_manager = DatabaseManager(db_path)
     
     def normalize_formula(self, formula_text: str) -> str:
         """
         Normalize formula text for better parsing
         """
-        # Replace common OCR mistakes and symbols
         replacements = {
             '×': '*',
             '÷': '/',
-            '—': '-',
             '–': '-',
+            '—': '-',
             '²': '**2',
             '³': '**3',
             '√': 'sqrt',
@@ -75,14 +53,11 @@ class FormulaProcessor:
         try:
             normalized = self.normalize_formula(formula_text)
             
-            # Try to parse with sympy
             try:
-                # First try direct parsing
                 expr = parse_expr(normalized, transformations='all')
                 parsed_successfully = True
             except:
                 try:
-                    # Try LaTeX parsing if available
                     expr = parse_latex(normalized)
                     parsed_successfully = True
                 except:
@@ -100,14 +75,9 @@ class FormulaProcessor:
             }
             
             if expr:
-                # Extract variables
                 variables = list(expr.free_symbols)
                 result['variables'] = [str(var) for var in variables]
-                
-                # Determine formula type
                 result['formula_type'] = self.classify_formula(expr, normalized)
-                
-                # Generate executable Python code
                 result['executable_code'] = self.generate_executable_code(expr, variables)
             
             return result
@@ -152,14 +122,10 @@ class FormulaProcessor:
         Generate executable Python code for the formula
         """
         try:
-            # Convert sympy expression to Python code
             var_names = [str(var) for var in variables]
-            
             if not var_names:
-                # Constant expression
                 code = f"def calculate():\n    import math\n    import numpy as np\n    return {expr}"
             else:
-                # Function with variables
                 params = ", ".join(var_names)
                 code = f"def calculate({params}):\n    import math\n    import numpy as np\n    return {expr}"
             
@@ -190,9 +156,9 @@ class FormulaProcessor:
         
         return " | ".join(parts)
     
-    def store_formula(self, page_number: int, source_file: str, formula_data: Dict):
+    def store_formula(self, document_id: int, page_number: int, source_file: str, formula_data: Dict):
         """
-        Store formula in SQLite database
+        Store formula in SQLite database with document tracking
         """
         try:
             conn = sqlite3.connect(self.db_path)
@@ -203,10 +169,11 @@ class FormulaProcessor:
             
             cursor.execute('''
             INSERT INTO formulas (
-                page_number, source_file, original_formula, parsed_formula,
+                document_id, page_number, source_file, original_formula, parsed_formula,
                 formula_type, variables, description, executable_code
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
+                document_id,
                 page_number,
                 source_file,
                 formula_data['original'],
@@ -220,15 +187,21 @@ class FormulaProcessor:
             conn.commit()
             conn.close()
             
-            print(f"Stored formula from page {page_number}: {formula_data['formula_type']}")
+            print(f"Stored formula from page {page_number} for document {document_id}: {formula_data['formula_type']}")
             
         except Exception as e:
             print(f"Error storing formula: {str(e)}")
     
-    def process_formula_pages(self, formula_pages: List[Dict]):
+    def process_formula_pages(self, document_id: int, formula_pages: List[Dict]):
         """
-        Process all pages containing formulas
+        Process all pages containing formulas for a specific document
         """
+        if not formula_pages:
+            print("No formula pages to process")
+            return
+            
+        print(f"Processing {len(formula_pages)} formula pages for document {document_id}")
+        
         for page_info in formula_pages:
             page_number = page_info['page']
             image_path = page_info['path']
@@ -238,26 +211,20 @@ class FormulaProcessor:
             
             for formula_info in formulas:
                 formula_text = formula_info['formula']
-                
-                # Parse the formula
                 formula_data = self.parse_formula(formula_text)
-                
-                # Store in database
-                import os
                 source_file = os.path.basename(image_path)
-                self.store_formula(page_number, source_file, formula_data)
+                self.store_formula(document_id, page_number, source_file, formula_data)
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) < 2:
-        print("Usage: python formula_processor.py <content_analysis.json>")
+        print("Usage: python updated_formula_processor.py <content_analysis.json>")
         sys.exit(1)
-    
-    # Load content analysis results
     with open(sys.argv[1], 'r') as f:
         analysis_results = json.load(f)
+    document_id = 1  
     
     processor = FormulaProcessor()
-    processor.process_formula_pages(analysis_results['formula_pages'])
+    processor.process_formula_pages(document_id, analysis_results['formula_pages'])
     
     print("Formula processing and storage complete!")
