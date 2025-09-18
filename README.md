@@ -1,16 +1,5 @@
 # PDF RAG Processing Pipeline
 
-A GPU-optimized Python pipeline for processing PDFs and creating a Retrieval-Augmented Generation (RAG) system. This tool extracts text, tables, and formulas from PDF documents, stores them in a searchable database, and provides an interactive query interface.
-
-## Features
-
-- **Multi-format Content Extraction**: Extracts text, tables, and mathematical formulas from PDF documents
-- **GPU Optimization**: Supports GPU acceleration for faster processing (optional)
-- **OCR Options**: Multiple OCR modes from lightweight to high-accuracy
-- **Vector Search**: Semantic search using vector embeddings
-- **Interactive Querying**: Built-in RAG system for natural language queries
-- **Flexible Configuration**: Customizable processing parameters and memory settings
-
 ## Architecture
 
 The pipeline consists of several interconnected components:
@@ -33,12 +22,6 @@ The pipeline consists of several interconnected components:
 - [Qdrant](https://qdrant.tech/) vector database (running locally or remotely)
 
 ### System Dependencies
-
-**Ubuntu/Debian:**
-```bash
-sudo apt update
-sudo apt install tesseract-ocr poppler-utils
-```
 
 **macOS:**
 ```bash
@@ -276,119 +259,3 @@ rag_database.db            # SQLite database with extracted content
   ]
 }
 ```
-
-## Troubleshooting
-
-### Common Issues
-
-**1. ModuleNotFoundError: No module named 'pdf2image'**
-```bash
-pip install pdf2image
-# Also ensure poppler is installed (see installation section)
-```
-
-**2. Tesseract not found**
-```bash
-# Ubuntu/Debian
-sudo apt install tesseract-ocr
-
-# macOS
-brew install tesseract
-
-# Windows: Add Tesseract to PATH or set TESSDATA_PREFIX
-```
-
-**3. GPU memory errors**
-```bash
-# Reduce batch size or disable GPU
-python main.py document.pdf --batch_size 2 --gpu_mode disable
-```
-
-**4. Qdrant connection failed**
-```bash
-# Start Qdrant server
-docker run -p 6333:6333 qdrant/qdrant
-
-# Or modify connection settings in vector_store_manager.py
-```
-
-**5. Out of memory errors**
-```bash
-# Use low memory mode
-python main.py document.pdf --low_memory
-
-# Or customize settings
-python main.py document.pdf --batch_size 1 --ocr_mode lightweight
-```
-
-### Performance Optimization Tips
-
-1. **GPU Memory**: Start with smaller batch sizes (2-4) and increase gradually
-2. **CPU Processing**: Use larger batch sizes (8-16) for CPU-only mode
-3. **Memory Usage**: Monitor memory usage and adjust `--batch_size` accordingly
-4. **OCR Speed**: Use `lightweight` mode for faster processing, `cpu_accurate` for better accuracy
-
-### Debug Mode
-
-For debugging, you can run individual components:
-
-```bash
-# Test PDF conversion only
-python pdf_converter.py document.pdf
-
-# Test content detection only
-python content_detector.py pdf_processing/images/ --mode lightweight
-
-# Test vector storage only
-python vector_store_manager.py content_analysis.json
-```
-
-## API Usage
-
-You can also use the components programmatically:
-
-```python
-from main import PDFRAGOrchestrator
-from rag_pipeline import RAGPipeline
-
-# Initialize orchestrator
-orchestrator = PDFRAGOrchestrator(
-    output_dir="my_processing",
-    gpu_mode="auto",
-    batch_size=4,
-    ocr_mode="lightweight"
-)
-
-# Process PDF
-success = orchestrator.process_pdf("document.pdf", dpi=300)
-
-if success:
-    # Initialize RAG pipeline for querying
-    rag = RAGPipeline(db_path="rag_database.db")
-    response = rag.process_query("What are the main findings?")
-    print(response)
-```
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Acknowledgments
-
-- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) for text recognition
-- [EasyOCR](https://github.com/JaidedAI/EasyOCR) for advanced OCR capabilities
-- [Qdrant](https://qdrant.tech/) for vector similarity search
-- [Sentence Transformers](https://github.com/UKPLab/sentence-transformers) for text embeddings
-- [SymPy](https://www.sympy.org/) for mathematical formula processing
-
----
-
-For more detailed information about specific components, please refer to the source code documentation in each module.
